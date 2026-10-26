@@ -4,7 +4,7 @@
 -- que esta sendo baixado abaixo, para evitar recursao.
 
 local SOURCE_URL = "https://raw.githubusercontent.com/luizguilhermemachado/steal-a-egg/main/StealAnEgg_Delta_Android.lua"
-local WALK_SPEED = 100 -- WalkSpeed padrao do Roblox costuma ser 16; 100 e muito mais rapido.
+local WALK_SPEED = 1000 -- WalkSpeed padrao do Roblox costuma ser 16; 100 e muito mais rapido.
 
 local okFetch, source = pcall(function()
     return game:HttpGet(SOURCE_URL)
