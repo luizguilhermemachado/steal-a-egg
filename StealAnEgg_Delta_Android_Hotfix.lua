@@ -4,7 +4,7 @@
 -- que esta sendo baixado abaixo, para evitar recursao.
 
 local SOURCE_URL = "https://raw.githubusercontent.com/luizguilhermemachado/steal-a-egg/main/StealAnEgg_Delta_Android.lua"
-local WALK_SPEED = 50000000000 -- WalkSpeed padrao do Roblox costuma ser 16; 100 e muito mais rapido.
+local WALK_SPEED = 100 -- Valor alto, mas finito; valores absurdos podem causar correcoes de movimento pelo jogo.
 
 local okFetch, source = pcall(function()
     return game:HttpGet(SOURCE_URL)
@@ -36,24 +36,40 @@ local function chr()
 end
 
 local SAE_ORIGINAL_SPEEDS = setmetatable({}, {__mode="k"})
+local SAE_SPEED_CONNECTIONS = setmetatable({}, {__mode="k"})
 local SAE_WALK_SPEED = 100
+
 local function applySAESpeed()
     local character=LP.Character
     local humanoid=character and character:FindFirstChildOfClass("Humanoid")
-    if humanoid and humanoid.Health>0 then
-        if SAE_ORIGINAL_SPEEDS[humanoid]==nil then
-            SAE_ORIGINAL_SPEEDS[humanoid]=humanoid.WalkSpeed
-        end
-        if humanoid.WalkSpeed~=SAE_WALK_SPEED then
-            pcall(function() humanoid.WalkSpeed=SAE_WALK_SPEED end)
-        end
+    if not humanoid or humanoid.Health<=0 then return end
+
+    if SAE_ORIGINAL_SPEEDS[humanoid]==nil then
+        SAE_ORIGINAL_SPEEDS[humanoid]=humanoid.WalkSpeed
+    end
+
+    if not SAE_SPEED_CONNECTIONS[humanoid] then
+        local ok, connection=pcall(function()
+            return humanoid:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+                if S.alive and humanoid.Parent and humanoid.Health>0
+                    and humanoid.WalkSpeed~=SAE_WALK_SPEED then
+                    pcall(function() humanoid.WalkSpeed=SAE_WALK_SPEED end)
+                end
+            end)
+        end)
+        if ok then SAE_SPEED_CONNECTIONS[humanoid]=connection end
+    end
+
+    if humanoid.WalkSpeed~=SAE_WALK_SPEED then
+        pcall(function() humanoid.WalkSpeed=SAE_WALK_SPEED end)
     end
 end
 
 task.spawn(function()
     while S.alive do
-        applySAESpeed()
-        task.wait(0.25)
+        local ok, err=pcall(applySAESpeed)
+        if not ok then warn("[SAE Speed] "..tostring(err)) end
+        task.wait(0.1)
     end
 end)
 
@@ -150,39 +166,61 @@ local function getEggs()
     local tagged = {}
     local source = {}
 
+    local function addPrompt(prompt, isTagged)
+        if prompt and prompt:IsA("ProximityPrompt") and prompt:IsDescendantOf(workspace) then
+            source[prompt] = true
+            if isTagged then tagged[prompt] = true end
+        end
+    end
+
+    -- A tag pode estar no prompt ou no modelo/parte que contem o prompt.
+    local function addTaggedObject(obj)
+        if not obj or not obj:IsDescendantOf(workspace) then return end
+        if obj:IsA("ProximityPrompt") then
+            addPrompt(obj, true)
+            return
+        end
+        for _, descendant in ipairs(obj:GetDescendants()) do
+            if descendant:IsA("ProximityPrompt") then
+                addPrompt(descendant, true)
+            end
+        end
+    end
+
     local ok, items = pcall(function()
         return CS:GetTagged("CarryAreaEgg")
     end)
     if ok and type(items) == "table" then
         for _, obj in ipairs(items) do
-            if obj:IsA("ProximityPrompt") and obj:IsDescendantOf(workspace) then
-                tagged[obj] = true
-                source[obj] = true
-            end
+            pcall(addTaggedObject, obj)
         end
     end
 
-    -- Descoberta complementar sempre executada, mesmo se houver prompts taggeados.
+    -- Varredura complementar para prompts reais que nao tenham a tag diretamente.
     for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("ProximityPrompt") and obj:IsDescendantOf(workspace) then
-            local node = obj.Parent
+        if obj:IsA("ProximityPrompt") then
             local looksLikeEgg = false
+            local node = obj.Parent
             local depth = 0
-            while node and node ~= workspace and depth < 8 do
+            while node and node ~= workspace and depth < 10 do
                 local low = norm(node.Name)
-                if low:find("egg", 1, true) or low:find("ovo", 1, true) then
+                if low:find("egg", 1, true) or low:find("ovo", 1, true)
+                    or low:find("carryareaegg", 1, true) then
                     looksLikeEgg = true
                 end
-                for _, key in ipairs({"EggName", "PetName", "Pet", "Egg", "AssetName"}) do
-                    if node:GetAttribute(key) ~= nil then
+                for _, key in ipairs({"EggName", "PetName", "Pet", "AssetName", "Egg"}) do
+                    local attribute = node:GetAttribute(key)
+                    if attribute ~= nil and tostring(attribute) ~= "" then
                         looksLikeEgg = true
                     end
                 end
                 node = node.Parent
                 depth += 1
             end
+
             local promptText = norm((obj.Name or "") .. " " .. (obj.ActionText or "") .. " " .. (obj.ObjectText or ""))
-            if promptText:find("egg", 1, true) or promptText:find("ovo", 1, true) then
+            if promptText:find("egg", 1, true) or promptText:find("ovo", 1, true)
+                or promptText:find("halloween", 1, true) then
                 looksLikeEgg = true
             end
             if looksLikeEgg then source[obj] = true end
@@ -190,7 +228,7 @@ local function getEggs()
     end
 
     local _, root = chr()
-    local eggs = {}
+    local worldEggs, lobbyEggs = {}, {}
     local rarityRanks = {
         common=1, uncommon=2, rare=3, epic=4, legendary=5,
         mythic=6, cosmic=7, divine=8, eternal=9, secret=10,
@@ -207,19 +245,26 @@ local function getEggs()
             if part:find("lobby", 1, true) then inLobby = true end
             if part:find("preview", 1, true) or part:find("showcase", 1, true)
                 or part:find("display", 1, true) or part:find("decorative", 1, true)
-                or part:find("decoration", 1, true) then
+                or part:find("decoration", 1, true) or part:find("statue", 1, true) then
                 decorative = true
             end
             node = node.Parent
             depth += 1
         end
 
-        if not decorative and not inLobby then
+        if not decorative then
             local pos = promptPos(prompt)
             if pos then
                 local name, rarity, value = metadata(prompt)
-                if S.filter == "" or norm(name):find(norm(S.filter), 1, true)
-                    or norm(rarity):find(norm(S.filter), 1, true) then
+                local mergedText = norm(name .. " " .. rarity .. " " .. (prompt.ActionText or "")
+                    .. " " .. (prompt.ObjectText or "") .. " " .. path)
+                local lobbyHalloween = inLobby and
+                    (mergedText:find("halloween", 1, true) or mergedText:find("hallow", 1, true))
+
+                -- Ignora o ovo tematico/decorativo de Halloween dentro do lobby.
+                if not lobbyHalloween and
+                    (S.filter == "" or norm(name):find(norm(S.filter), 1, true)
+                    or norm(rarity):find(norm(S.filter), 1, true)) then
                     local rarityScore = 0
                     local rarityText = norm(rarity)
                     for key, rank in pairs(rarityRanks) do
@@ -227,24 +272,36 @@ local function getEggs()
                             rarityScore = math.max(rarityScore, rank)
                         end
                     end
-                    table.insert(eggs, {
+                    local egg = {
                         prompt=prompt, pos=pos, name=name, rarity=rarity,
                         value=value, rarityScore=rarityScore,
                         dist=root and (root.Position-pos).Magnitude or math.huge,
-                        tagged=tagged[prompt] == true, path=path,
-                    })
+                        tagged=tagged[prompt] == true, path=path, inLobby=inLobby,
+                    }
+                    if inLobby then
+                        table.insert(lobbyEggs, egg)
+                    else
+                        table.insert(worldEggs, egg)
+                    end
                 end
             end
         end
     end
 
-    -- Melhor renda primeiro; raridade como desempate; distancia por ultimo.
-    table.sort(eggs, function(a, b)
-        if a.value ~= b.value then return a.value > b.value end
-        if a.rarityScore ~= b.rarityScore then return a.rarityScore > b.rarityScore end
-        return a.dist < b.dist
-    end)
+    local function sortEggs(eggs)
+        table.sort(eggs, function(a, b)
+            if a.value ~= b.value then return a.value > b.value end
+            if a.rarityScore ~= b.rarityScore then return a.rarityScore > b.rarityScore end
+            return a.dist < b.dist
+        end)
+    end
 
+    sortEggs(worldEggs)
+    sortEggs(lobbyEggs)
+
+    -- Alvos fora do lobby sempre tem prioridade. O lobby so e usado como fallback
+    -- se a busca nao conseguiu localizar nenhum ovo no mapa principal.
+    local eggs = #worldEggs > 0 and worldEggs or lobbyEggs
     S.eggs = eggs
     S.lastEggCount = #eggs
     return eggs
@@ -304,7 +361,7 @@ source = replaceOnce(source,
 -- Restaura a velocidade original quando o menu/script for destruido.
 source = replaceOnce(source,
     'function S.Destroy()\n    S.alive=false',
-    'function S.Destroy()\n    S.alive=false\n    for humanoid, originalSpeed in pairs(SAE_ORIGINAL_SPEEDS) do\n        if humanoid and humanoid.Parent then pcall(function() humanoid.WalkSpeed=originalSpeed end) end\n    end'
+    'function S.Destroy()\n    S.alive=false\n    for _, connection in pairs(SAE_SPEED_CONNECTIONS) do if connection then pcall(function() connection:Disconnect() end) end end\n    for humanoid, originalSpeed in pairs(SAE_ORIGINAL_SPEEDS) do\n        if humanoid and humanoid.Parent then pcall(function() humanoid.WalkSpeed=originalSpeed end) end\n    end'
 )
 
 -- Mantem o valor configuravel no topo sincronizado com o codigo injetado.
