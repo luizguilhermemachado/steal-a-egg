@@ -173,7 +173,6 @@ local function getEggs()
         end
     end
 
-    -- A tag pode estar no prompt ou no modelo/parte que contem o prompt.
     local function addTaggedObject(obj)
         if not obj or not obj:IsDescendantOf(workspace) then return end
         if obj:IsA("ProximityPrompt") then
@@ -181,24 +180,19 @@ local function getEggs()
             return
         end
         for _, descendant in ipairs(obj:GetDescendants()) do
-            if descendant:IsA("ProximityPrompt") then
-                addPrompt(descendant, true)
-            end
+            if descendant:IsA("ProximityPrompt") then addPrompt(descendant, true) end
         end
     end
 
-    local ok, items = pcall(function()
-        return CS:GetTagged("CarryAreaEgg")
-    end)
+    local ok, items = pcall(function() return CS:GetTagged("CarryAreaEgg") end)
     if ok and type(items) == "table" then
-        for _, obj in ipairs(items) do
-            pcall(addTaggedObject, obj)
-        end
+        for _, obj in ipairs(items) do pcall(addTaggedObject, obj) end
     end
 
-    -- Varredura complementar para prompts reais que nao tenham a tag diretamente.
+    local rawPromptCount = 0
     for _, obj in ipairs(workspace:GetDescendants()) do
         if obj:IsA("ProximityPrompt") then
+            rawPromptCount += 1
             local looksLikeEgg = false
             local node = obj.Parent
             local depth = 0
@@ -210,17 +204,13 @@ local function getEggs()
                 end
                 for _, key in ipairs({"EggName", "PetName", "Pet", "AssetName", "Egg"}) do
                     local attribute = node:GetAttribute(key)
-                    if attribute ~= nil and tostring(attribute) ~= "" then
-                        looksLikeEgg = true
-                    end
+                    if attribute ~= nil and tostring(attribute) ~= "" then looksLikeEgg = true end
                 end
                 node = node.Parent
                 depth += 1
             end
-
             local promptText = norm((obj.Name or "") .. " " .. (obj.ActionText or "") .. " " .. (obj.ObjectText or ""))
-            if promptText:find("egg", 1, true) or promptText:find("ovo", 1, true)
-                or promptText:find("halloween", 1, true) then
+            if promptText:find("egg", 1, true) or promptText:find("ovo", 1, true) then
                 looksLikeEgg = true
             end
             if looksLikeEgg then source[obj] = true end
@@ -228,7 +218,8 @@ local function getEggs()
     end
 
     local _, root = chr()
-    local worldEggs, lobbyEggs = {}, {}
+    local eggs = {}
+    local lobbyExcluded, halloweenExcluded, decorativeExcluded = 0, 0, 0
     local rarityRanks = {
         common=1, uncommon=2, rare=3, epic=4, legendary=5,
         mythic=6, cosmic=7, divine=8, eternal=9, secret=10,
@@ -252,56 +243,46 @@ local function getEggs()
             depth += 1
         end
 
-        if not decorative then
-            local pos = promptPos(prompt)
-            if pos then
-                local name, rarity, value = metadata(prompt)
-                local mergedText = norm(name .. " " .. rarity .. " " .. (prompt.ActionText or "")
-                    .. " " .. (prompt.ObjectText or "") .. " " .. path)
-                local lobbyHalloween = inLobby and
-                    (mergedText:find("halloween", 1, true) or mergedText:find("hallow", 1, true))
+        local name, rarity, value = metadata(prompt)
+        local mergedText = norm(name .. " " .. rarity .. " " .. (prompt.Name or "")
+            .. " " .. (prompt.ActionText or "") .. " " .. (prompt.ObjectText or "") .. " " .. path)
+        local isHalloween = mergedText:find("halloween", 1, true) ~= nil
+            or mergedText:find("hallow", 1, true) ~= nil
 
-                -- Ignora o ovo tematico/decorativo de Halloween dentro do lobby.
-                if not lobbyHalloween and
-                    (S.filter == "" or norm(name):find(norm(S.filter), 1, true)
-                    or norm(rarity):find(norm(S.filter), 1, true)) then
-                    local rarityScore = 0
-                    local rarityText = norm(rarity)
-                    for key, rank in pairs(rarityRanks) do
-                        if rarityText:find(key, 1, true) then
-                            rarityScore = math.max(rarityScore, rank)
-                        end
-                    end
-                    local egg = {
-                        prompt=prompt, pos=pos, name=name, rarity=rarity,
-                        value=value, rarityScore=rarityScore,
-                        dist=root and (root.Position-pos).Magnitude or math.huge,
-                        tagged=tagged[prompt] == true, path=path, inLobby=inLobby,
-                    }
-                    if inLobby then
-                        table.insert(lobbyEggs, egg)
-                    else
-                        table.insert(worldEggs, egg)
-                    end
+        if inLobby then lobbyExcluded += 1 end
+        if isHalloween then halloweenExcluded += 1 end
+        if decorative then decorativeExcluded += 1 end
+
+        -- Só considera ovos do mapa principal: não volta para ovo cosmético de lobby.
+        if not inLobby and not decorative and not isHalloween then
+            local pos = promptPos(prompt)
+            if pos and (S.filter == "" or norm(name):find(norm(S.filter), 1, true)
+                or norm(rarity):find(norm(S.filter), 1, true)) then
+                local rarityScore = 0
+                local rarityText = norm(rarity)
+                for key, rank in pairs(rarityRanks) do
+                    if rarityText:find(key, 1, true) then rarityScore = math.max(rarityScore, rank) end
                 end
+                table.insert(eggs, {
+                    prompt=prompt, pos=pos, name=name, rarity=rarity, value=value,
+                    rarityScore=rarityScore,
+                    dist=root and (root.Position-pos).Magnitude or math.huge,
+                    tagged=tagged[prompt] == true, path=path,
+                })
             end
         end
     end
 
-    local function sortEggs(eggs)
-        table.sort(eggs, function(a, b)
-            if a.value ~= b.value then return a.value > b.value end
-            if a.rarityScore ~= b.rarityScore then return a.rarityScore > b.rarityScore end
-            return a.dist < b.dist
-        end)
-    end
+    table.sort(eggs, function(a, b)
+        if a.value ~= b.value then return a.value > b.value end
+        if a.rarityScore ~= b.rarityScore then return a.rarityScore > b.rarityScore end
+        return a.dist < b.dist
+    end)
 
-    sortEggs(worldEggs)
-    sortEggs(lobbyEggs)
-
-    -- Alvos fora do lobby sempre tem prioridade. O lobby so e usado como fallback
-    -- se a busca nao conseguiu localizar nenhum ovo no mapa principal.
-    local eggs = #worldEggs > 0 and worldEggs or lobbyEggs
+    S.rawPromptCount = rawPromptCount
+    S.lobbyExcludedCount = lobbyExcluded
+    S.halloweenExcludedCount = halloweenExcluded
+    S.decorativeExcludedCount = decorativeExcluded
     S.eggs = eggs
     S.lastEggCount = #eggs
     return eggs
@@ -352,6 +333,109 @@ end
 
 ]=])
 
+-- Substitui o caminho a pe por teleporte ao alvo e adiciona coleta+retorno em um toque.
+source = replaceBetween(source, "local function requestPickup(egg)", "local function toggleFarm()", [=[
+local function requestPickup(egg)
+    if not egg or not egg.prompt or not egg.prompt.Parent then return false,"ovo desapareceu" end
+    if type(fireproximityprompt)~="function" then
+        return false,"Delta nao disponibilizou fireproximityprompt"
+    end
+    local ok, message=pcall(function() fireproximityprompt(egg.prompt) end)
+    if not ok then return false,tostring(message) end
+    return true,"interacao solicitada; coleta ainda nao confirmada pelo servidor"
+end
+
+local function teleportToPosition(position, offset)
+    local character, root, hum=chr()
+    if not character or not root or not hum or hum.Health<=0 then
+        return false,"personagem indisponivel"
+    end
+    local targetPosition=position + (offset or Vector3.zero)
+    local ok, message=pcall(function()
+        root.AssemblyLinearVelocity=Vector3.zero
+        root.AssemblyAngularVelocity=Vector3.zero
+        character:PivotTo(CFrame.new(targetPosition))
+        root.AssemblyLinearVelocity=Vector3.zero
+        root.AssemblyAngularVelocity=Vector3.zero
+    end)
+    if not ok then return false,tostring(message) end
+    task.wait(0.35)
+    local _, newRoot=chr()
+    if not newRoot then return false,"personagem sumiu apos tentar teleporte" end
+    local remaining=(newRoot.Position-targetPosition).Magnitude
+    if remaining>15 then
+        return false,string.format("posicao foi corrigida/rejeitada (distancia %.1f)",remaining)
+    end
+    return true
+end
+
+local function goEgg()
+    S.farm=false
+    stopMove()
+    local eggs=getEggs()
+    if #eggs==0 then
+        S.pendingEgg=nil
+        trace("Nenhum ovo real fora do lobby encontrado. Use DIAGNOSTICO / COPIAR.")
+        return
+    end
+    local egg=eggs[1]
+    trace("Tentando teleporte para "..egg.name.." | renda="..tostring(egg.value))
+    task.spawn(function()
+        local ok, reason=teleportToPosition(egg.pos, Vector3.new(0,3,0))
+        if ok then
+            S.pendingEgg=egg
+            trace("Perto de "..egg.name..". Clique COLETAR OVO + VOLTAR À BASE.")
+        else
+            S.pendingEgg=nil
+            errlog("Teleporte ao ovo: "..tostring(reason))
+        end
+    end)
+end
+
+local function collectAndReturn()
+    if not S.base then
+        trace("Primeiro clique em MARCAR BASE ONDE ESTOU.")
+        return
+    end
+    local egg=S.pendingEgg
+    if not egg or not egg.prompt or not egg.prompt.Parent then
+        trace("Primeiro use IR ATE O MELHOR OVO (TELEPORTE).")
+        return
+    end
+    local _, root=chr()
+    if not root then errlog("Personagem indisponivel") return end
+    if (root.Position-egg.pos).Magnitude>18 then
+        trace("Voce esta longe do ovo. Tente o teleporte novamente.")
+        return
+    end
+
+    local picked, reason=requestPickup(egg)
+    if not picked then errlog("Coleta: "..tostring(reason)) return end
+    trace("Interacao com "..egg.name.." solicitada; voltando para base...")
+    task.spawn(function()
+        task.wait(0.9)
+        local home, why=teleportToPosition(S.base, Vector3.zero)
+        if home then
+            S.success+=1
+            S.pendingEgg=nil
+            trace("Retorno à base executado. Confirme no jogo se a coleta/deposito foi validada.")
+        else
+            errlog("Retorno à base: "..tostring(why))
+        end
+    end)
+end
+
+]=])
+
+-- Renomeia o primeiro botao e adiciona a acao de coletar e voltar com um toque.
+source = replaceOnce(source,
+    'btn("IR ATE O MELHOR OVO",goEgg)',
+    'btn("IR ATE O MELHOR OVO (TELEPORTE)",goEgg)\n    btn("COLETAR OVO + VOLTAR À BASE",collectAndReturn)')
+
+-- Expõe as quantidades excluidas para ajudar a diagnosticar o mapa real.
+source = replaceOnce(source,
+    '"Ovos encontrados="..tostring(#eggs),',
+    '"Ovos reais encontrados="..tostring(#eggs),\n            "Prompts="..tostring(S.rawPromptCount or 0).." | lobby ignorado="..tostring(S.lobbyExcludedCount or 0).." | Halloween ignorado="..tostring(S.halloweenExcludedCount or 0).." | decorativo ignorado="..tostring(S.decorativeExcludedCount or 0),')
 -- Melhora o diagnostico para confirmar renda, raridade, distancia e origem do prompt.
 source = replaceOnce(source,
     'lines[#lines+1]=i..". "..eggs[i].name.."/"..eggs[i].rarity',
