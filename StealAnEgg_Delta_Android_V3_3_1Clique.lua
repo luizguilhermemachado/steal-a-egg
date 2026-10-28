@@ -1,5 +1,7 @@
--- STEAL AN EGG | DELTA ANDROID V3.3 | 28/10/2026
--- MODO UNICO: ovo real > ir andando > coletar > TP imediato a refúgio (nao exige deposito na base).
+-- STEAL AN EGG | DELTA ANDROID V3.4 | 28/10/2026
+-- FARM POR BOTAO: melhor ovo > caminhar > coletar > tentar TP ao refugio.
+-- TP AO PEGAR OVO: vigilante independente, ativado por padrao; funciona tambem ao pegar manualmente.
+-- O farm NUNCA inicia sozinho ao carregar o script.
 -- Refugio por zona segura identificada, SpawnLocation ou base como ultima alternativa.
 -- FIX: ovos de compra / loja / zona segura nao entram no ranking nem ESP.
 -- Botao para ignorar a localizacao do alvo incorreto caso nao haja metadados suficientes.
@@ -28,16 +30,19 @@ local C = {
     ignoreShops = true, requireGuardian = true, blockRadius = 22,
     protectMutated = true, autoSellArmed = false,
     autoPlace = false, autoHatch = false, autoEquip = false,
-    autoSell = false, autoTrain = false, autoFarm = true, eggESP = false,
+    autoSell = false, autoTrain = false, autoFarm = false, eggESP = false,
 }
 local S = {
-    alive = true, busy = false, token = 0, status = "Pronto. Abra DIAGNOSTICO antes do farm.",
+    alive = true, busy = false, token = 0, status = "Pronto: farm DESLIGADO. TP automatico ao pegar ovo LIGADO.",
     error = "", source = {}, eggList = {}, petList = {}, inventory = {},
     plot = nil, pen = nil, origin = nil, treadmill = nil,
     safe = nil, safeMode = "nao definido", refuge = nil, refugeMode = "nao identificado",
     pickupSignalAt = -1000, pickupSignalSource = "", escapeCompleted = false, currentTarget = nil, carrying = false,
     carryingKnown = false, carryVersion = 0,
     returnPending = false, returning = false, manualReturnQueued = false, lastReturnAttempt = -1000,
+    escapeRequested = false, escapeRequestedAt = -1000, escapeSource = "",
+    lastCarrySeenAt = -1000, lastCarryAbsentAt = -1000, pendingEscapeReason = "",
+    pickupSignalWasManual = false,
     lastCarrySource = "nao detectado", lastReturnOutcome = "nao testado",
     attempts = 0, grabbed = 0, deposited = 0, failed = 0,
     locked = {}, remoteCache = {}, inflight = {},
@@ -688,10 +693,8 @@ local function attributeCarry(inst)
     return false
 end
 carryEvidence=function()
-    if S.pickupSignalAt and os.clock()-S.pickupSignalAt < 2.5 then
-        S.lastCarrySource="prompt de coleta (nao confirmado): "..S.pickupSignalSource
-        return true,S.lastCarrySource
-    end
+    -- Preferir sinais de carregamento efetivo. Um prompt disparado e so um indicio:
+    -- pode ter sido recusado por velocidade, guardiao ou servidor.
     if S.carryingKnown and S.carrying then
         S.lastCarrySource="evento de carregamento"
         return true,S.lastCarrySource
@@ -730,8 +733,36 @@ carryEvidence=function()
             end
         end
     end
+    -- Fallback para jogos que nao replicam o estado de carry ao cliente:
+    -- PromptTriggered do proprio ovo (nao de loja) inicia uma tentativa de fuga.
+    -- E intencionalmente identificado como INDICIO, e nao confirmacao de posse.
+    if S.pickupSignalAt and os.clock()-S.pickupSignalAt > .12
+        and os.clock()-S.pickupSignalAt < 2.2 then
+        S.lastCarrySource="INDICIO: prompt do ovo acionado (coleta nao confirmada)"
+        return true,S.lastCarrySource
+    end
     S.lastCarrySource="nao detectado"
     return false,S.lastCarrySource
+end
+
+-- Pedido de fuga tem prioridade sobre caminhar ate outro ovo.
+-- Interrompe o movimento em andamento, mas deixa a operacao encerrar antes
+-- de agendar o TP: evita que outra rotina altere a posicao simultaneamente.
+local function requestEscape(source)
+    if not C.autoReturn or not S.alive or S.returning or S.manualReturnQueued then return end
+    if S.escapeCompleted or S.escapeRequested then return end
+    if os.clock()-S.lastReturnAttempt < 5 then return end
+    S.escapeRequested = true
+    S.escapeRequestedAt = os.clock()
+    S.escapeSource = tostring(source or "ovo detectado")
+    S.returnPending = true
+    C.autoFarm = false
+    if S.busy then
+        S.token = S.token + 1 -- faz moveWalk parar na proxima verificacao
+        local root,hum = char()
+        if hum then pcall(function() hum:Move(Vector3.zero, false) end) end
+    end
+    log("OVO DETECTADO: priorizando TP para zona segura (" .. S.escapeSource .. ")")
 end
 
 -- Botao manual tambem chama esta funcao. O parametro force serve quando o
@@ -747,6 +778,8 @@ local function returnHome(token,force,before)
     S.returnPending=false
     local function finish(ok,msg)
         S.returning=false
+        S.escapeRequested=false
+        S.returnPending=false
         S.lastReturnOutcome=tostring(msg)
         if ok then log(msg) end
         return ok,msg
@@ -1125,31 +1158,50 @@ local function drawESP(list)
         table.insert(S.esp,peg)
     end
 end
--- Retorno automatico INDEPENDENTE do AUTO FARM e da chamada de coleta.
--- Se um ovo for apanhado manualmente ou por prompt, pode acionar a volta.
+-- Vigilante independente: permanece ligado mesmo com o FARM desligado.
+-- Ao detectar um ovo, interrompe tarefas concorrentes e tenta o TP prioritario.
+-- Se o jogo nao replica carry, PromptTriggered funciona como INDICIO, nao prova.
 local function startReturnWatcher()
     task.spawn(function()
         while S.alive do
-            if C.autoReturn and not S.returning and not S.manualReturnQueued then
+            if C.autoReturn and not S.manualReturnQueued then
                 local carrying,source=carryEvidence()
+                local root=char()
                 if carrying then
-                    S.returnPending=true
-                    if not S.busy and os.clock()-S.lastReturnAttempt>8 then
-                        local root=char()
-                        if not S.refuge then pcall(selectRefuge) end
-                        local distance=(root and S.refuge)
-                            and (root.Position-S.refuge).Magnitude or math.huge
-                        if distance>15 and not S.escapeCompleted then
-                            runExclusive("Volta automatica",function(token)
-                                return returnHome(token,false)
-                            end)
-                        end
+                    S.lastCarrySeenAt=os.clock()
+                    if not S.refuge and not S.returning then pcall(selectRefuge) end
+                    local distance=(root and S.refuge)
+                        and (root.Position-S.refuge).Magnitude or math.huge
+                    if distance>16 and not S.escapeCompleted and not S.returning then
+                        requestEscape(source)
                     end
                 else
-                    S.returnPending=false
+                    S.lastCarryAbsentAt=os.clock()
+                    -- Permitir uma nova coleta depois que o ovo anterior sumiu.
+                    if S.escapeCompleted and not S.returning then
+                        S.escapeCompleted=false
+                    end
                 end
+                if S.escapeRequested and not S.busy and not S.returning
+                    and os.clock()-S.lastReturnAttempt>4 then
+                    local recent = os.clock()-S.escapeRequestedAt<7
+                    if recent then
+                        -- O sinal permanece pendente ate returnHome finalizar,
+                        -- impedindo que o vigilante agende dois retornos.
+                        runExclusive("TP automatico ao pegar ovo",function(token)
+                            return returnHome(token,true)
+                        end)
+                    else
+                        S.escapeRequested=false
+                        S.returnPending=false
+                        log("Sinal de ovo expirou: nao vou teleportar sem novo sinal")
+                    end
+                end
+            elseif S.escapeRequested then
+                S.escapeRequested=false
+                S.returnPending=false
             end
-            task.wait(.25)
+            task.wait(.09)
         end
     end)
 end
@@ -1170,14 +1222,16 @@ end
 
 local function diagnostic()
     local out={
-        "STEAL AN EGG | V3.3 DIAGNOSTICO | "..os.date("%d/%m/%Y %H:%M"),
+        "STEAL AN EGG | V3.4 DIAGNOSTICO | "..os.date("%d/%m/%Y %H:%M"),
         "PlaceId="..tostring(game.PlaceId).." | PlaceVersion="..tostring(game.PlaceVersion),
         "Build esperado=107778070777162 | StreamingEnabled="..tostring(workspace.StreamingEnabled),
         "CatalogoAssets="..keys(defs.Assets):sub(1,150),
         "MutacoesModulo="..tostring(type(defs.Mutations.EarningsFor)),
         "Base="..tostring(S.plot and S.plot:GetFullName() or "NAO IDENTIFICADA"),
         "SafeBase="..S.safeMode.." | Refugio="..S.refugeMode.." | Destino="..tostring(S.refuge),
-        "RetornoAutomatico="..tostring(C.autoReturn).." | UltimaVolta="..S.lastReturnOutcome,
+        "FarmAutomaticoNoLoader=NAO | FarmLigado="..tostring(C.autoFarm),
+        "RetornoAoPegar="..tostring(C.autoReturn).." | FugaPendente="..tostring(S.escapeRequested),
+        "OrigemUltimaDeteccao="..tostring(S.escapeSource).." | UltimaVolta="..S.lastReturnOutcome,
         "OvoCarregado="..tostring(carryEvidence()).." | Fonte="..S.lastCarrySource,
         "Filtro de loja="..tostring(C.ignoreShops).." | Exigir area de chefao="..tostring(C.requireGuardian),
         "Catalogo de guardioes="..tostring((function() local n=0;for _ in pairs(defs.Guards) do n=n+1 end;return n end)()),
@@ -1288,7 +1342,7 @@ local function buildUI()
     if old then old:Destroy() end
     local gui=make("ScreenGui",parent,{Name="SAE_Delta_V3",ResetOnSpawn=false,DisplayOrder=160})
     UI.gui=gui
-    local opener=make("TextButton",gui,{Text="🥚 EGG V3.3",TextSize=13,Font=Enum.Font.GothamBold,
+    local opener=make("TextButton",gui,{Text="🥚 EGG V3.4",TextSize=13,Font=Enum.Font.GothamBold,
         TextColor3=Color3.new(1,1,1),BackgroundColor3=COLORS.accent,
         Size=UDim2.fromOffset(114,40),Position=UDim2.new(0,12,.16,0)})
     round(opener,11)
@@ -1302,7 +1356,7 @@ local function buildUI()
     make("UIStroke",panel,{Color=Color3.fromRGB(49,70,98),Thickness=1})
     local head=make("Frame",panel,{Size=UDim2.new(1,0,0,75),BackgroundColor3=COLORS.head})
     round(head,11)
-    label(head,"STEAL AN EGG  /  DELTA V3.3",15,COLORS.text,31).Position=UDim2.fromOffset(13,5)
+    label(head,"STEAL AN EGG  /  DELTA V3.4",15,COLORS.text,31).Position=UDim2.fromOffset(13,5)
     local meta=label(head,"1 CLIQUE  •  IDA A PE  •  TP REFUGIO",10,COLORS.muted,23)
     meta.Position=UDim2.fromOffset(13,33)
     local close=make("TextButton",head,{Text="−",TextSize=25,Font=Enum.Font.GothamBold,
@@ -1340,16 +1394,19 @@ local function buildUI()
     UI.pages.farm.Visible=true
     UI.indicators.farm.BackgroundColor3=COLORS.accent
     local farm=UI.pages.farm
-    pageSection(farm,"1 CLIQUE: MELHOR OVO > ANDAR > PEGAR > TP SEGURO")
-    button(farm,"INICIAR TUDO COM 1 CLIQUE",function()
+    pageSection(farm,"AUTO FARM: INICIO APENAS PELO BOTAO")
+    button(farm,"▶ INICIAR FARM: ANDAR > PEGAR > FUGIR",function()
         if S.busy then return log("Coleta ja em andamento") end
         S.escapeCompleted=false
+        S.escapeRequested=false
+        S.returnPending=false
         C.autoFarm=true
+        log("Farm iniciado por voce: localizar > caminhar > coletar > fugir")
         loopFarm()
     end,COLORS.accent)
-    toggle(farm,"AUTO FARM", "autoFarm",function(on)
-        if on then loopFarm() else stopFarm() end
-    end)
+    button(farm,"■ PARAR FARM (TP AO PEGAR CONTINUA)",function()
+        stopFarm()
+    end,COLORS.warn)
     button(farm,"PEGAR MELHOR OVO (1 VEZ)",function() runExclusive("Coletar",collectCycle) end,COLORS.accent)
     button(farm,"VERIFICAR O MELHOR OVO",function() runExclusive("Ranking",function()
         local e,reason=getField()
@@ -1378,7 +1435,11 @@ local function buildUI()
         else log("Nenhum bloqueio manual para remover") end
     end)
     pageSection(farm,"IDA ANDANDO / TP PARA ZONA SEGURA (SEM DEPOSITO)")
-    toggle(farm,"VOLTAR AUTO AO PEGAR O OVO","autoReturn")
+    toggle(farm,"TP AUTOMATICO AO PEGAR OVO (INDEPENDENTE)","autoReturn",function(on)
+        if not on then S.escapeRequested=false;S.returnPending=false end
+        log(on and "TP automatico LIGADO: pega ovo manualmente ou pelo farm" or
+            "TP automatico DESLIGADO: o botao manual continua disponivel")
+    end)
     toggle(farm,"TELEPORTE EM OUTRAS ROTINAS","allowWarp")
     toggle(farm,"ANDAR SE TP DE FUGA FALHAR","escapeWalkFallback")
     button(farm,"SAIR PARA ZONA SEGURA (MANUAL)",function()
@@ -1387,6 +1448,8 @@ local function buildUI()
         -- Interrompe caminhada/coleta automatica para que o botao funcione
         -- MESMO quando o Auto Farm ja esta ocupado com a ida.
         C.autoFarm=false
+        S.escapeRequested=false
+        S.returnPending=false
         S.token=S.token+1
         log("Retorno manual solicitado; interrompendo o movimento anterior...")
         task.spawn(function()
@@ -1533,7 +1596,8 @@ end
 function S.Destroy()
     if not S.alive then return end
     S.alive=false
-    C.autoFarm=false;C.autoTrain=false;C.eggESP=false
+    C.autoFarm=false;C.autoTrain=false;C.eggESP=false;C.autoReturn=false
+    S.escapeRequested=false; S.returnPending=false
     S.token=S.token+1
     clearESP()
     for _, cn in ipairs(S.connections) do pcall(function() cn:Disconnect() end) end
@@ -1544,22 +1608,34 @@ end
 env.__SAE_DELTA_V3=S
 loadDefs()
 listenCarry()
--- O prompt original do jogo pode ser o unico sinal de pickup disponivel no cliente.
-bind(game:GetService("ProximityPromptService").PromptTriggered,function(prompt)
-    if not S.alive or not S.currentTarget or shopPrompt(prompt) then return end
-    local p=worldPos(prompt)
-    if p and (p-S.currentTarget.position).Magnitude<16 then
-        S.pickupSignalAt=os.clock()
-        S.pickupSignalSource="PromptTriggered"
+-- O prompt original pode ser o unico indicio de pickup replicado.
+-- Escuta tambem ovos apanhados MANUALMENTE (sem alvo do auto farm).
+local CS=game:GetService("CollectionService")
+local function isFieldCarryPrompt(prompt)
+    if not (prompt and prompt:IsA("ProximityPrompt")) or shopPrompt(prompt) then return false end
+    local obj=prompt
+    for _=1,5 do
+        if obj and CS:HasTag(obj,"CarryAreaEgg") then return true end
+        obj=obj and obj.Parent
     end
+    -- Fallback para tags ausentes: palavras da acao mais contexto de ovo.
+    local action=(tostring(prompt.ActionText or "")):lower()
+    local label=(tostring(prompt.ObjectText or "").." "..tostring(prompt.Parent and prompt.Parent.Name or "")):lower()
+    local actionCarry=action:find("steal",1,true) or action:find("carry",1,true)
+        or action:find("grab",1,true) or action:find("pick",1,true)
+        or action:find("pegar",1,true) or action:find("roubar",1,true)
+    return (actionCarry and (label:find("egg",1,true) or label:find("ovo",1,true))) and true or false
+end
+bind(game:GetService("ProximityPromptService").PromptTriggered,function(prompt)
+    if not S.alive or not isFieldCarryPrompt(prompt) then return end
+    S.pickupSignalAt=os.clock()
+    S.pickupSignalWasManual=not C.autoFarm
+    S.pickupSignalSource="PromptTriggered: "..tostring(prompt.ActionText)
+    -- A verificacao real de carry acontece no vigilante em seguida.
 end)
 buildUI()
 startMaintenance()
 startReturnWatcher()
 espLoop()
-log("V3.3: um comando = buscar melhor ovo, andar, pegar, TP para refugio. Nao ha garantia contra rollback.")
-task.defer(function()
-    task.wait(.35)
-    if S.alive and C.autoFarm then loopFarm() end
-end)
+log("V3.4 carregada: FARM DESLIGADO. Aperte INICIAR FARM. TP ao pegar ovo LIGADO e independente.")
 return S
