@@ -1,8 +1,8 @@
--- STEAL AN EGG | DELTA ANDROID V3.4 | 28/10/2026
--- FARM POR BOTAO: melhor ovo > caminhar > coletar > tentar TP ao refugio.
+-- STEAL AN EGG | DELTA ANDROID V3.6 | 28/10/2026
+-- FARM POR BOTAO: melhor ovo > caminhar > coletar > TP para primeira fase > andar ate zona segura.
 -- TP AO PEGAR OVO: vigilante independente, ativado por padrao; funciona tambem ao pegar manualmente.
 -- O farm NUNCA inicia sozinho ao carregar o script.
--- Refugio por zona segura identificada, SpawnLocation ou base como ultima alternativa.
+-- TP de fuga para a PRIMEIRA FASE (Map1/SAE_ZoneId=1), depois CAMINHADA curta ate zona segura.
 -- FIX: ovos de compra / loja / zona segura nao entram no ranking nem ESP.
 -- Botao para ignorar a localizacao do alvo incorreto caso nao haja metadados suficientes.
 -- Arquivo independente: NAO baixa outro Lua, NAO altera WalkSpeed.
@@ -16,6 +16,7 @@ local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local UIS = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
 local LP = Players.LocalPlayer
 local env = ((type(getgenv) == "function") and getgenv()) or _G
 for _, key in ipairs({"__SAE_DELTA_V3", "__SAE_FARM_V2"}) do
@@ -25,7 +26,8 @@ end
 local C = {
     interval = 1.25, espRefresh = 3, espCount = 12,
     allowWarp = false, allowWalkFallback = true, autoReturn = true, warpStep = 24,
-    escapeWalkFallback = true, tryPrompt = true, stopAfterEscape = true,
+    escapeWalkFallback = false, escapeStageFirst = true, trySegmentedWarp = true,
+    tryTweenEscape = false, stageWarpStep = 38, tryPrompt = true, stopAfterEscape = true,
     minSellValue = 100, keepBest = 13, maxEquip = 13,
     ignoreShops = true, requireGuardian = true, blockRadius = 22,
     protectMutated = true, autoSellArmed = false,
@@ -37,11 +39,15 @@ local S = {
     error = "", source = {}, eggList = {}, petList = {}, inventory = {},
     plot = nil, pen = nil, origin = nil, treadmill = nil,
     safe = nil, safeMode = "nao definido", refuge = nil, refugeMode = "nao identificado",
+    stagePoint = nil, stageMode = "nao detectada", stageManual = nil,
+    lastStageWarp = "nao testado", lastStageWalk = "nao testado",
     pickupSignalAt = -1000, pickupSignalSource = "", escapeCompleted = false, currentTarget = nil, carrying = false,
     carryingKnown = false, carryVersion = 0,
     returnPending = false, returning = false, manualReturnQueued = false, lastReturnAttempt = -1000,
     escapeRequested = false, escapeRequestedAt = -1000, escapeSource = "",
     lastCarrySeenAt = -1000, lastCarryAbsentAt = -1000, pendingEscapeReason = "",
+    carryReady = false, carryAbsentSince = nil, carryPresentSince = nil,
+    autoReturnAttempted = false, carryStateStable = false,
     pickupSignalWasManual = false,
     lastCarrySource = "nao detectado", lastReturnOutcome = "nao testado",
     attempts = 0, grabbed = 0, deposited = 0, failed = 0,
@@ -552,21 +558,76 @@ local function selectRefuge()
             table.insert(candidates,{position=pos,mode="SpawnLocation: "..item.Name,tier=2})
         end
     end
-    if not S.pen or not S.pen.Parent then pcall(resolvePlot) end
-    if S.pen and S.pen.Parent then
-        table.insert(candidates,{position=S.pen.Position+Vector3.new(0,2,0),
-            mode="base (fallback: zona segura nao localizada)",tier=3})
-    end
+    -- A base NAO e uma zona segura garantida. Nao escolher uma base automaticamente
+    -- se o mapa nao disponibilizar SafeZone ou SpawnLocation reconhecivel.
     table.sort(candidates,function(a,b)
         if a.tier~=b.tier then return a.tier<b.tier end
         return (a.position-root.Position).Magnitude<(b.position-root.Position).Magnitude
     end)
     if #candidates==0 then
-        return false,"Sem SafeZone/SpawnLocation/base identificavel; nao vou inventar coordenadas"
+        return false,"Nenhuma SafeZone/SpawnLocation confiavel. Use USAR MINHA POSICAO COMO REFUGIO na zona segura."
     end
     S.refuge = candidates[1].position
     S.refugeMode = candidates[1].mode
     log("Refugio escolhido: "..S.refugeMode)
+    return true
+end
+
+-- Identifica a primeira fase pela GEOMETRIA REAL replicada no cliente.
+-- Preferir piso Map1 / zona com SAE_ZoneId=1; nao inferir coordenadas fixas da internet.
+local function firstStagePart()
+    local best, score = nil, -math.huge
+    for _,obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("BasePart") and obj.Size.X >= 30 and obj.Size.Z >= 25
+            and obj.Size.Y <= 45 then
+            local name=labelKey(obj.Name)
+            local id=obj:GetAttribute("SAE_ZoneId") or obj:GetAttribute("ZoneId")
+                or obj:GetAttribute("AreaId")
+            local scoreNow=nil
+            if name=="map1" then scoreNow=120
+            elseif tostring(id)=="1" then scoreNow=90
+            elseif name=="forest" or name=="floresta" or name=="firstzone"
+                or name=="zone1" or name=="area1" then scoreNow=75 end
+            if scoreNow then
+                -- Piso grande e plano costuma ser referencia mais confiavel que ornamento.
+                scoreNow=scoreNow + math.min(20, math.sqrt(obj.Size.X*obj.Size.Z)/15)
+                if scoreNow>score then best,score=obj,scoreNow end
+            end
+        end
+    end
+    return best
+end
+local function stageSurfacePoint(part, safePos)
+    local sz=part.Size
+    local cf=part.CFrame
+    local localSafe=cf:PointToObjectSpace(safePos)
+    -- Ponto dentro do piso, proximo da borda voltada para a SafeZone.
+    local pad=math.min(9,sz.X/5,sz.Z/5)
+    local x=math.clamp(localSafe.X,-sz.X/2+pad,sz.X/2-pad)
+    local z=math.clamp(localSafe.Z,-sz.Z/2+pad,sz.Z/2-pad)
+    local guessed=cf:PointToWorldSpace(Vector3.new(x,sz.Y/2+5,z))
+    local params=RaycastParams.new()
+    params.FilterType=Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances=LP.Character and {LP.Character} or {}
+    local hit=workspace:Raycast(guessed+Vector3.new(0,24,0),Vector3.new(0,-80,0),params)
+    return Vector3.new(guessed.X,hit and hit.Position.Y+3.4 or guessed.Y,guessed.Z)
+end
+local function selectFirstStage()
+    if S.stageManual and typeof(S.stageManual)=="Vector3" then
+        S.stagePoint=S.stageManual
+        S.stageMode="PRIMEIRA FASE MARCADA MANUALMENTE"
+        return true
+    end
+    if not S.refuge then
+        local ok,why=selectRefuge()
+        if not ok then return false,why end
+    end
+    local first=firstStagePart()
+    if not first then
+        return false,"Map1/SAE_ZoneId=1 nao encontrado. Va a primeira fase e aperte MARCAR PRIMEIRA FASE."
+    end
+    S.stagePoint=stageSurfacePoint(first,S.refuge)
+    S.stageMode="primeira fase: "..first:GetFullName()
     return true
 end
 
@@ -611,6 +672,88 @@ local function warpTo(pos, token)
     end
     return false,"TP rejeitado pelo servidor"
 end
+-- Alternativa experimental: deslocamentos menores no lugar do grande salto.
+-- Usa a mesma propriedade fisica CFrame. NAO contorna validacao de carry do servidor.
+local function warpBySteps(pos, token)
+    local root=char()
+    if not root then return false,"Sem personagem" end
+    if typeof(pos)~="Vector3" then return false,"Destino invalido" end
+    local start=root.Position
+    local distance=(start-pos).Magnitude
+    local step=math.clamp(C.stageWarpStep or 22,10,48)
+    local hops=math.ceil(distance/step)
+    if hops>130 then return false,"Distancia muito grande para TP por etapas ("..hops.." saltos)" end
+    if hops==0 then return true,"Ja chegou" end
+    for i=1,hops do
+        if not S.alive or (token and token~=S.token) then return false,"Cancelado" end
+        root=char()
+        if not root then return false,"Personagem perdido durante TP em etapas" end
+        local remaining=pos-root.Position
+        local n=remaining.Magnitude
+        if n<=8 then break end
+        local nextP=root.Position+remaining.Unit*math.min(step,n)
+        local ok,err=pcall(function()
+            root.CFrame=CFrame.new(nextP+Vector3.new(0,2,0))
+            root.AssemblyLinearVelocity=Vector3.zero
+        end)
+        if not ok then return false,"Erro CFrame por etapas: "..tostring(err) end
+        task.wait(.08)
+        root=char()
+        if not root then return false,"Morreu ao tentar TP em etapas" end
+        if (root.Position-nextP).Magnitude>15 then
+            return false,"Servidor reverteu etapa "..i.."/"..hops
+        end
+    end
+    task.wait(.8)
+    root=char()
+    if not root then return false,"Personagem indisponivel apos etapas" end
+    if (root.Position-pos).Magnitude<=12 then
+        return true,"TP por etapas (posicao local; ovo nao confirmado)"
+    end
+    return false,"TP por etapas nao chegou ao destino / rollback"
+end
+
+-- Metodo adicional EXCLUSIVAMENTE experimental: Tween linear em trajetos curtos.
+-- Nao ancora o personagem, nao troca Humanoid e nao mexe em WalkSpeed.
+-- So tentar se voce habilitar o toggle; o servidor pode recusar da mesma maneira.
+local function warpByTween(pos,token)
+    if typeof(pos)~="Vector3" then return false,"Destino invalido" end
+    local startClock=os.clock()
+    local maxTime=40
+    for _=1,180 do
+        if not S.alive or (token and token~=S.token) then return false,"Cancelado" end
+        local root=char()
+        if not root then return false,"Personagem indisponivel no Tween" end
+        local dist=(pos-root.Position).Magnitude
+        if dist<=10 then
+            task.wait(.75)
+            root=char()
+            if root and (pos-root.Position).Magnitude<=14 then
+                return true,"Tween chegou (localmente; ovo nao confirmado)"
+            end
+            return false,"Tween revertido pelo servidor"
+        end
+        if os.clock()-startClock>maxTime then return false,"Tween excedeu 40 segundos" end
+        local step=math.min(34,dist)
+        local nextPos=root.Position+(pos-root.Position).Unit*step
+        local duration=math.max(.07,step/220)
+        local ok,why=pcall(function()
+            local tween=TweenService:Create(root,TweenInfo.new(duration,Enum.EasingStyle.Linear),
+                {CFrame=CFrame.new(nextPos)})
+            tween:Play()
+            task.wait(duration+.035)
+            tween:Cancel()
+        end)
+        if not ok then return false,"Tween erro: "..tostring(why) end
+        root=char()
+        if not root then return false,"Personagem morreu no Tween" end
+        if (root.Position-nextPos).Magnitude>15 then
+            return false,"Tween revertido / bloqueado (etapa)"
+        end
+    end
+    return false,"Tween nao concluiu etapas"
+end
+
 local function moveTo(pos, token)
     if C.allowWarp then
         local ok,reason=warpTo(pos,token)
@@ -675,7 +818,7 @@ end
 -- Os ovos carregados do campo podem ser modelos anexados ao Character,
 -- atributos de estado ou um sinal de rede; NAO necessariamente sao Tool.
 -- Tool em Backpack frequentemente aparece apenas depois do deposito.
-local EGG_CARRY_FLAGS = {"IsCarryingEgg","CarryingEgg","IsCarrying","HoldingEgg","HasFieldEgg"}
+local EGG_CARRY_FLAGS = {"IsCarryingEgg","CarryingEgg","HoldingEgg","HasFieldEgg"}
 local EGG_CARRY_IDS = {"CarryingEggUid","CarriedEggUid","CarriedEggId","HeldEggUid","CarryingUid"}
 local function attributeCarry(inst)
     if not inst then return false end
@@ -710,7 +853,7 @@ carryEvidence=function()
             if obj:IsA("Model") or obj:IsA("Tool") or obj:IsA("BasePart") then
                 local k=obj.Name:lower():gsub("[%s_%-]", "")
                 if k:find("carriedegg",1,true) or k:find("carryegg",1,true)
-                    or k:find("holdegg",1,true) or k=="fieldegg" then
+                    or k:find("holdegg",1,true) then
                     local reason="modelo de ovo no personagem: "..obj.Name
                     S.lastCarrySource=reason
                     return true,reason
@@ -726,21 +869,15 @@ carryEvidence=function()
         if ok and type(data)=="table" then
             for _, key in ipairs({"IsCarrying","IsCarryingEgg","CarryingEgg","CarriedEgg"}) do
                 local val=rawget(data,key)
-                if val==true or (type(val)=="table" and next(val)~=nil) then
+                if val==true then
                     S.lastCarrySource="EggState."..key
                     return true,S.lastCarrySource
                 end
             end
         end
     end
-    -- Fallback para jogos que nao replicam o estado de carry ao cliente:
-    -- PromptTriggered do proprio ovo (nao de loja) inicia uma tentativa de fuga.
-    -- E intencionalmente identificado como INDICIO, e nao confirmacao de posse.
-    if S.pickupSignalAt and os.clock()-S.pickupSignalAt > .12
-        and os.clock()-S.pickupSignalAt < 2.2 then
-        S.lastCarrySource="INDICIO: prompt do ovo acionado (coleta nao confirmada)"
-        return true,S.lastCarrySource
-    end
+    -- NUNCA usar PromptTriggered como prova de carregamento.
+    -- Pode ser acionado por um prompt recusado pelo servidor ou por interacao decorativa.
     S.lastCarrySource="nao detectado"
     return false,S.lastCarrySource
 end
@@ -753,6 +890,7 @@ local function requestEscape(source)
     if S.escapeCompleted or S.escapeRequested then return end
     if os.clock()-S.lastReturnAttempt < 5 then return end
     S.escapeRequested = true
+    S.autoReturnAttempted = true -- uma tentativa automatica por retirada real de ovo
     S.escapeRequestedAt = os.clock()
     S.escapeSource = tostring(source or "ovo detectado")
     S.returnPending = true
@@ -771,9 +909,10 @@ local function returnHome(token,force,before)
     if S.returning then return false,"Retorno ja esta em andamento" end
     local carrying,source=carryEvidence()
     if not force and not carrying then
-        return false,"Nao detectei a coleta. Use o botao SAIR PARA ZONA SEGURA se ja estiver com o ovo."
+        return false,"Nao detectei o ovo. Use SAIR PARA ZONA SEGURA (MANUAL) se estiver com ele."
     end
     S.returning=true
+    S.autoReturnAttempted=true
     S.lastReturnAttempt=os.clock()
     S.returnPending=false
     local function finish(ok,msg)
@@ -790,42 +929,69 @@ local function returnHome(token,force,before)
         local ok,reason=selectRefuge()
         if not ok then return finish(false,reason) end
     end
-    local destination=S.refuge
-    if (root.Position-destination).Magnitude<=12 then
+    local safe=S.refuge
+    if (root.Position-safe).Magnitude<=12 then
         S.escapeCompleted=true
         C.autoFarm=false
-        return finish(true,"Ja esta no refugio: "..S.refugeMode..". Entrega do ovo NAO confirmada.")
+        return finish(true,"Ja esta na zona segura. Entrega do ovo nao confirmada.")
     end
-    -- Nao consultar inventario nem esperar antes de fugir: o chefe ja esta correndo.
-    log("COLETA ACIONADA ("..tostring(source)..")! TP IMEDIATO ao refugio: "..S.refugeMode)
-    local arrived,why=warpTo(destination,token)
-    if arrived then
-        -- Espera uma janela extra para detectar rollback, sem prometer validacao do servidor.
-        task.wait(.65)
+    if not C.escapeStageFirst then
+        -- Modo legado selecionavel: TP direto ao refugio, sem caminhada longa involuntaria.
+        local ok,why=warpTo(safe,token)
+        if not ok then return finish(false,"TP direto recusado: "..tostring(why)) end
+        task.wait(.6)
         root=char()
-        if root and (root.Position-destination).Magnitude<=15 then
-            S.escapeCompleted=true
-            C.autoFarm=false -- pausar com o ovo; nao tentar coletar outro sem entrega
-            S.pickupSignalAt=-1000
-            return finish(true,"CHEGOU AO REFUGIO (localmente). Confira se o ovo continua nas maos. Entrega NAO confirmada.")
+        if not root or (root.Position-safe).Magnitude>15 then
+            return finish(false,"TP direto foi revertido pelo servidor")
         end
-        why="Servidor reverteu o TP apos a verificacao inicial"
+        S.escapeCompleted=true
+        C.autoFarm=false
+        return finish(true,"Perto da zona segura localmente. Confira o ovo.")
     end
-    if C.escapeWalkFallback then
+
+    -- Novo modo: ir para a borda da PRIMEIRA FASE e completar o trajeto andando.
+    local found,reason=selectFirstStage()
+    if not found then return finish(false,reason) end
+    local stage=S.stagePoint
+    if (stage-safe).Magnitude>220 then
+        return finish(false,"Primeira fase muito longe do refugio detectado ("..math.floor((stage-safe).Magnitude).." studs); verifique os marcadores")
+    end
+    if (root.Position-stage).Magnitude>14 then
+        log("OVO DETECTADO: TP para PRIMEIRA FASE e depois caminhada curta. "..S.stageMode)
+        local ok,why=warpTo(stage,token)
+        if not ok and C.trySegmentedWarp then
+            log("TP direto para primeira fase falhou ("..tostring(why).."). Tentando TP por etapas...")
+            ok,why=warpBySteps(stage,token)
+        end
+        if not ok and C.tryTweenEscape then
+            log("TPs falharam; tentando Tween experimental, sem alterar WalkSpeed...")
+            ok,why=warpByTween(stage,token)
+        end
+        S.lastStageWarp=(ok and "ACEITO LOCALMENTE: " or "FALHOU: ")..tostring(why)
+        if not ok then
+            -- Nao comecar corrida ate a base a partir da ultima fase.
+            return finish(false,"Nao foi possivel chegar a primeira fase por TP: "..tostring(why)..". Sem corrida longa automatica.")
+        end
+        task.wait(.55)
         root=char()
-        if root then
-            log("TP recusado: "..tostring(why)..". Fuga por caminhada para o refugio...")
-            local okWalk, walkWhy=moveWalk(destination,100,token,true)
-            if okWalk then
-                S.escapeCompleted=true
-                C.autoFarm=false
-                S.pickupSignalAt=-1000
-                return finish(true,"Chegou ao refugio ANDANDO, nao por TP. Entrega NAO confirmada.")
-            end
-            return finish(false,"TP falhou ("..tostring(why)..") e caminhada falhou ("..tostring(walkWhy)..")")
+        if not root or (root.Position-stage).Magnitude>18 then
+            S.lastStageWarp="ROLLBACK apos teleporte"
+            return finish(false,"Servidor reverteu TP da primeira fase. Sem corrida longa automatica.")
         end
+    else
+        S.lastStageWarp="JA ESTAVA NA PRIMEIRA FASE"
     end
-    return finish(false,"TP com ovo recusado: "..tostring(why)..". O servidor controla esse movimento.")
+    -- Andar apenas do limite da primeira fase ate o refugio detectado.
+    log("TP primeira fase OK localmente. ANDANDO "..math.floor((stage-safe).Magnitude).." studs ate zona segura")
+    local okWalk,walkWhy=moveWalk(safe,38,token,true)
+    S.lastStageWalk=(okWalk and "CHEGOU: " or "FALHOU: ")..tostring(walkWhy)
+    if not okWalk then
+        return finish(false,"TP inicial feito; caminhada final nao concluida: "..tostring(walkWhy))
+    end
+    S.escapeCompleted=true
+    C.autoFarm=false
+    S.pickupSignalAt=-1000
+    return finish(true,"ZONA SEGURA ALCANCADA localmente via primeira fase. Confirme se o ovo foi mantido; deposito NAO confirmado.")
 end
 
 local function findCarryPrompt(egg)
@@ -1169,17 +1335,33 @@ local function startReturnWatcher()
                 local root=char()
                 if carrying then
                     S.lastCarrySeenAt=os.clock()
-                    if not S.refuge and not S.returning then pcall(selectRefuge) end
-                    local distance=(root and S.refuge)
-                        and (root.Position-S.refuge).Magnitude or math.huge
-                    if distance>16 and not S.escapeCompleted and not S.returning then
-                        requestEscape(source)
+                    S.carryAbsentSince=nil
+                    if not S.carryPresentSince then S.carryPresentSince=os.clock() end
+                    -- Nunca disparar na inicializacao se ja houver um sinal persistente.
+                    -- Exigimos ter visto um estado SEM ovo antes de armar a automacao.
+                    local stable=(os.clock()-S.carryPresentSince)>=.35
+                    if stable and S.carryReady and not S.autoReturnAttempted then
+                        S.carryStateStable=true
+                        if not S.refuge and not S.returning then pcall(selectRefuge) end
+                        local distance=(root and S.refuge)
+                            and (root.Position-S.refuge).Magnitude or math.huge
+                        if distance>16 and not S.escapeCompleted and not S.returning then
+                            requestEscape(source)
+                        end
                     end
                 else
                     S.lastCarryAbsentAt=os.clock()
-                    -- Permitir uma nova coleta depois que o ovo anterior sumiu.
-                    if S.escapeCompleted and not S.returning then
-                        S.escapeCompleted=false
+                    S.carryPresentSince=nil
+                    if not S.carryAbsentSince then S.carryAbsentSince=os.clock() end
+                    -- Exigir ausencia estavel, nao uma falha isolada de leitura,
+                    -- antes de habilitar a proxima coleta.
+                    if os.clock()-S.carryAbsentSince >= 1.0 then
+                        S.carryReady=true
+                        S.carryStateStable=false
+                        S.autoReturnAttempted=false
+                        if S.escapeCompleted and not S.returning then
+                            S.escapeCompleted=false
+                        end
                     end
                 end
                 if S.escapeRequested and not S.busy and not S.returning
@@ -1222,15 +1404,19 @@ end
 
 local function diagnostic()
     local out={
-        "STEAL AN EGG | V3.4 DIAGNOSTICO | "..os.date("%d/%m/%Y %H:%M"),
+        "STEAL AN EGG | V3.6 DIAGNOSTICO | "..os.date("%d/%m/%Y %H:%M"),
         "PlaceId="..tostring(game.PlaceId).." | PlaceVersion="..tostring(game.PlaceVersion),
         "Build esperado=107778070777162 | StreamingEnabled="..tostring(workspace.StreamingEnabled),
         "CatalogoAssets="..keys(defs.Assets):sub(1,150),
         "MutacoesModulo="..tostring(type(defs.Mutations.EarningsFor)),
         "Base="..tostring(S.plot and S.plot:GetFullName() or "NAO IDENTIFICADA"),
         "SafeBase="..S.safeMode.." | Refugio="..S.refugeMode.." | Destino="..tostring(S.refuge),
+        "ModoFugaPrimeiraFase="..tostring(C.escapeStageFirst).." | TPporEtapas="..tostring(C.trySegmentedWarp).." | TweenExperimental="..tostring(C.tryTweenEscape),
+        "Fase1="..S.stageMode.." | Ponto="..tostring(S.stagePoint),
+        "UltimoTPFase1="..S.lastStageWarp.." | UltimaCaminhada="..S.lastStageWalk,
         "FarmAutomaticoNoLoader=NAO | FarmLigado="..tostring(C.autoFarm),
-        "RetornoAoPegar="..tostring(C.autoReturn).." | FugaPendente="..tostring(S.escapeRequested),
+        "RetornoAoPegar="..tostring(C.autoReturn).." | FugaPendente="..tostring(S.escapeRequested).." | AndarSeFalhar="..tostring(C.escapeWalkFallback),
+        "DetectorArmado="..tostring(S.carryReady).." | DeteccaoEstavel="..tostring(S.carryStateStable).." | FugaJaTentada="..tostring(S.autoReturnAttempted),
         "OrigemUltimaDeteccao="..tostring(S.escapeSource).." | UltimaVolta="..S.lastReturnOutcome,
         "OvoCarregado="..tostring(carryEvidence()).." | Fonte="..S.lastCarrySource,
         "Filtro de loja="..tostring(C.ignoreShops).." | Exigir area de chefao="..tostring(C.requireGuardian),
@@ -1342,7 +1528,7 @@ local function buildUI()
     if old then old:Destroy() end
     local gui=make("ScreenGui",parent,{Name="SAE_Delta_V3",ResetOnSpawn=false,DisplayOrder=160})
     UI.gui=gui
-    local opener=make("TextButton",gui,{Text="🥚 EGG V3.4",TextSize=13,Font=Enum.Font.GothamBold,
+    local opener=make("TextButton",gui,{Text="🥚 EGG V3.5",TextSize=13,Font=Enum.Font.GothamBold,
         TextColor3=Color3.new(1,1,1),BackgroundColor3=COLORS.accent,
         Size=UDim2.fromOffset(114,40),Position=UDim2.new(0,12,.16,0)})
     round(opener,11)
@@ -1356,8 +1542,8 @@ local function buildUI()
     make("UIStroke",panel,{Color=Color3.fromRGB(49,70,98),Thickness=1})
     local head=make("Frame",panel,{Size=UDim2.new(1,0,0,75),BackgroundColor3=COLORS.head})
     round(head,11)
-    label(head,"STEAL AN EGG  /  DELTA V3.4",15,COLORS.text,31).Position=UDim2.fromOffset(13,5)
-    local meta=label(head,"1 CLIQUE  •  IDA A PE  •  TP REFUGIO",10,COLORS.muted,23)
+    label(head,"STEAL AN EGG  /  DELTA V3.5",15,COLORS.text,31).Position=UDim2.fromOffset(13,5)
+    local meta=label(head,"FARM MANUAL  •  TP FASE 1  •  ANDAR ZONA SEGURA",10,COLORS.muted,23)
     meta.Position=UDim2.fromOffset(13,33)
     local close=make("TextButton",head,{Text="−",TextSize=25,Font=Enum.Font.GothamBold,
         TextColor3=COLORS.text,BackgroundTransparency=1,Size=UDim2.fromOffset(36,36),
@@ -1434,15 +1620,51 @@ local function buildUI()
         if last then log("Bloqueio removido: "..last.label)
         else log("Nenhum bloqueio manual para remover") end
     end)
-    pageSection(farm,"IDA ANDANDO / TP PARA ZONA SEGURA (SEM DEPOSITO)")
+    pageSection(farm,"FUGA: PRIMEIRA FASE (TP) > ZONA SEGURA (ANDANDO)")
+    toggle(farm,"FUGIR VIA PRIMEIRA FASE: TP + ANDAR", "escapeStageFirst")
+    toggle(farm,"TP POR ETAPAS SE O DIRETO FALHAR", "trySegmentedWarp")
+    toggle(farm,"TWEEN EXPERIMENTAL SE TP FALHAR (OFF)", "tryTweenEscape")
+    button(farm,"DETECTAR PRIMEIRA FASE (MAP1)",function()
+        runExclusive("Detectar fase 1",function()
+            local ok,reason=selectFirstStage()
+            if ok then log("Fase 1: "..S.stageMode.." | "..tostring(S.stagePoint)) end
+            return ok,reason
+        end)
+    end)
+    button(farm,"TESTAR TWEEN PARA PRIMEIRA FASE (SEM OVO)",function()
+        runExclusive("Teste Tween fase 1",function(token)
+            local ok,why=selectFirstStage()
+            if not ok then return false,why end
+            local success,reason=warpByTween(S.stagePoint,token)
+            S.lastStageWarp=(success and "TWEEN TESTE OK LOCAL: " or "TWEEN TESTE FALHOU: ")..tostring(reason)
+            return success,reason
+        end)
+    end)
+    button(farm,"MARCAR PRIMEIRA FASE (ONDE ESTOU)",function()
+        local root=char()
+        if not root then return fail("Personagem indisponivel") end
+        S.stageManual=root.Position
+        S.stagePoint=root.Position
+        S.stageMode="primeira fase marcada manualmente"
+        log("Fase 1 marcada manualmente. Va para zona segura antes de testar TP.")
+    end)
+    button(farm,"TESTAR TP PRIMEIRA FASE (SEM OVO)",function()
+        runExclusive("Teste primeira fase",function(token)
+            local ok,why=selectFirstStage()
+            if not ok then return false,why end
+            local success,reason=warpTo(S.stagePoint,token)
+            S.lastStageWarp=(success and "TESTE LOCAL OK: " or "TESTE FALHOU: ")..tostring(reason)
+            return success,reason
+        end)
+    end)
     toggle(farm,"TP AUTOMATICO AO PEGAR OVO (INDEPENDENTE)","autoReturn",function(on)
         if not on then S.escapeRequested=false;S.returnPending=false end
-        log(on and "TP automatico LIGADO: pega ovo manualmente ou pelo farm" or
+        log(on and "TP automatico LIGADO: exige deteccao estavel; TP fase 1 + andar ate SafeZone" or
             "TP automatico DESLIGADO: o botao manual continua disponivel")
     end)
     toggle(farm,"TELEPORTE EM OUTRAS ROTINAS","allowWarp")
-    toggle(farm,"ANDAR SE TP DE FUGA FALHAR","escapeWalkFallback")
-    button(farm,"SAIR PARA ZONA SEGURA (MANUAL)",function()
+    -- Sem fallback de caminhada longa: se TP fase 1 falhar, PARAR.
+    button(farm,"FUGIR VIA PRIMEIRA FASE (MANUAL)",function()
         if S.manualReturnQueued then log("Retorno manual ja solicitado");return end
         S.manualReturnQueued=true
         -- Interrompe caminhada/coleta automatica para que o botao funcione
@@ -1481,7 +1703,7 @@ local function buildUI()
         S.refuge=root.Position;S.refugeMode="posicao escolhida no jogo"
         log("Refugio alterado para posicao atual")
     end)
-    button(farm,"TESTAR TELEPORTE PARA REFUGIO",function()
+    button(farm,"TESTAR TP DIRETO PARA REFUGIO (SEM OVO)",function()
         runExclusive("Teste TP",function(token)
             if not S.refuge then
                 local ok,err=selectRefuge();if not ok then return false,err end
@@ -1598,6 +1820,7 @@ function S.Destroy()
     S.alive=false
     C.autoFarm=false;C.autoTrain=false;C.eggESP=false;C.autoReturn=false
     S.escapeRequested=false; S.returnPending=false
+    S.autoReturnAttempted=false
     S.token=S.token+1
     clearESP()
     for _, cn in ipairs(S.connections) do pcall(function() cn:Disconnect() end) end
@@ -1637,5 +1860,5 @@ buildUI()
 startMaintenance()
 startReturnWatcher()
 espLoop()
-log("V3.4 carregada: FARM DESLIGADO. Aperte INICIAR FARM. TP ao pegar ovo LIGADO e independente.")
+log("V3.6 carregada: FARM OFF. FUGA ao pegar ovo = TP primeira fase + andar ate zona segura. Sem corrida longa se TP falhar.")
 return S
